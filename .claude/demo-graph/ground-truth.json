@@ -1,0 +1,20 @@
+{"note":"Answer key for the seeded corpus. Kept OUT of the repo during the demo so auditors could not read it; added after the last stage.",
+ "bugs":[
+ {"id":"P1","file":"app/payments/PaymentClient.scala","line":17,"cat":"missing-timeout"},
+ {"id":"P2","file":"app/payments/PaymentClient.scala","line":20,"cat":"unbounded-retry"},
+ {"id":"P3","file":"app/payments/PaymentClient.scala","line":18,"cat":"missing-idempotency"},
+ {"id":"O1","file":"app/orders/OrderService.scala","line":12,"cat":"blocking-in-async"},
+ {"id":"O2","file":"app/orders/OrderService.scala","line":13,"cat":"blocking-in-async"},
+ {"id":"O3","file":"app/orders/OrderService.scala","line":15,"cat":"swallowed-exception"},
+ {"id":"I1","file":"src/main/java/demo/inventory/InventoryConsumer.java","line":12,"cat":"unbounded-pool"},
+ {"id":"I2","file":"src/main/java/demo/inventory/InventoryConsumer.java","line":13,"cat":"unbounded-queue"},
+ {"id":"I3","file":"src/main/java/demo/inventory/InventoryConsumer.java","line":33,"cat":"swallowed-exception"},
+ {"id":"S1","file":"src/main/java/demo/shipping/ShippingGateway.java","line":12,"cat":"missing-timeout"},
+ {"id":"S2","file":"src/main/java/demo/shipping/ShippingGateway.java","line":14,"cat":"naive-retry"},
+ {"id":"S3","file":"src/main/java/demo/shipping/ShippingGateway.java","line":16,"cat":"missing-idempotency"}],
+ "decoys":[
+ {"file":"app/payments/PaymentClient.scala","line":27,"note":"refundStatus has a 3s timeout"},
+ {"file":"app/payments/PaymentClient.scala","line":30,"note":"recover logs and rethrows"},
+ {"file":"app/orders/OrderService.scala","line":18,"note":"blocking{} on dedicated blockingEc (used as the canary)"},
+ {"file":"src/main/java/demo/inventory/InventoryConsumer.java","line":17,"note":"RestTemplate built with connect/read timeouts"},
+ {"file":"src/main/java/demo/shipping/ShippingGateway.java","line":24,"note":"f.get(2, SECONDS) is a bounded wait"}]}

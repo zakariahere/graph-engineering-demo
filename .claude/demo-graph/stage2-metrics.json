@@ -1,0 +1,1 @@
+{"stage":2,"agents":4,"subagent_tokens":157520,"duration_ms":13993,"findings":24,"planted_hit":12,"planted_total":12,"decoys_flagged":0,"suspect":["Inventory:24 offer() on unbounded LBQ always returns true","PaymentClient:20 swallowed - actually logged+retried","Shipping:14 immediate retry - default backoff 1000ms","Order:20 unbounded result - off-theme, decoy region"]}

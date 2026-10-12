@@ -1,0 +1,39 @@
+{
+  "summary": "Single agent audits all chosen files for resilience defects",
+  "agentCount": 1,
+  "logs": [],
+  "result": {
+    "report": "app/payments/PaymentClient.scala:16 | unbounded-retry | high | chargeWithRetry recovers from any Throwable (line 20) and recurses with no attempt cap or backoff (line 22).\napp/payments/PaymentClient.scala:17 | missing-timeout | high | The charge POST sets no request timeout, unlike refundStatus which sets withRequestTimeout at line 27.\napp/payments/PaymentClient.scala:17 | missing-idempotency | high | The charge POST at lines 17-18 sends no idempotency key and is retried on any failure, so a retry can double-charge.\napp/payments/PaymentClient.scala:19 | swallowed-error | med | `.map(_.json)` never checks the HTTP status, so 4xx/5xx responses count as success and body parse failures are retried.\napp/orders/OrderService.scala:12 | blocking-in-future | high | Await.result(payments.charge(...), 30.seconds) blocks a thread of the implicit ec inside the Future body opened at line 10.\napp/orders/OrderService.scala:13 | blocking-in-future | med | Thread.sleep(200) runs inside the Future body on the ec thread pool.\napp/orders/OrderService.scala:15 | swallowed-exception | high | `recover { case _: Exception => None }` discards the cause with no logging, so charge failures, timeouts and JSON errors all become None.\napp/orders/OrderService.scala:11 | missing-idempotency | med | repo.insert runs before the charge with no compensation when the charge fails (line 15 returns None), and a caller retry would insert a duplicate order.\nsrc/main/java/demo/inventory/InventoryConsumer.java:12 | unbounded-pool | med | Executors.newCachedThreadPool() has no upper bound on thread count.\nsrc/main/java/demo/inventory/InventoryConsumer.java:13 | unbounded-queue | med | LinkedBlockingQueue is created with no capacity bound.\nsrc/main/java/demo/inventory/InventoryConsumer.java:25 | unbounded-submission | med | Every onMessage call submits another drain task (line 25) on top of the unbounded queue and pool.\nsrc/main/java/demo/inventory/InventoryConsumer.java:33 | swallowed-exception | high | The empty catch block at lines 33-34 silently drops failed reservations, with no logging, retry or dead-letter handling.\nsrc/main/java/demo/shipping/ShippingGateway.java:12 | missing-timeout | high | `new RestTemplate()` is built with no connect or read timeouts, so it applies to both createShipment (line 16) and trackingStatus (line 22).\nsrc/main/java/demo/shipping/ShippingGateway.java:14 | naive-retry | high | @Retryable(maxAttempts = 10) sets no backoff and no retryFor, so every exception is retried immediately.\nsrc/main/java/demo/shipping/ShippingGateway.java:16 | missing-idempotency | high | The carrier POST in createShipment is retried by @Retryable with no idempotency key, so retries can create duplicate shipments.\nsrc/main/java/demo/shipping/ShippingGateway.java:22 | blocking-in-future | med | The blocking RestTemplate call runs inside CompletableFuture.supplyAsync, which uses the common ForkJoinPool by default.\nsrc/main/java/demo/shipping/ShippingGateway.java:23 | resource-leak | med | f.get(2, SECONDS) times out but never cancels f, so the HTTP call keeps running and holding a pool thread.\nTOTAL: 17"
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Audit"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "audit:all",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a10cb474cb1cd6f54",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825042008,
+      "queuedAt": 1791825042004,
+      "attempt": 1,
+      "lastToolName": "Read",
+      "lastToolSummary": "C:\\workspace\\playground\\dirt\\graphengineeringdemo\\src\\main\\…",
+      "promptPreview": "You are auditing source files for RESILIENCE defects only: missing timeouts, unbounded or naive retries, blocking calls inside Future/async code, swallowed exceptions, missing idempotency, unbounded queues/pools.\nFiles (read each with the Read tool, paths relative to the working directory):\n- app/payments/PaymentClient.scala\n- app/orders/OrderService.scala\n- src/main/java/demo/inventory/InventoryC…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825061616,
+      "tokens": 41304,
+      "toolCalls": 4,
+      "durationMs": 19606,
+      "resultPreview": "app/payments/PaymentClient.scala:16 | unbounded-retry | high | chargeWithRetry recovers from any Throwable (line 20) and recurses with no attempt cap or backoff (line 22).\napp/payments/PaymentClient.scala:17 | missing-timeout | high | The charge POST sets no request timeout, unlike refundStatus which sets withRequestTimeout at line 27.\napp/payments/PaymentClient.scala:17 | missing-idempotency | hi…"
+    }
+  ],
+  "totalTokens": 41304,
+  "totalToolCalls": 4
+}

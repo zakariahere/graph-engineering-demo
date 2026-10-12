@@ -1,0 +1,425 @@
+{
+  "summary": "Typed per-file audit, then independent adversarial verifiers gate each finding",
+  "agentCount": 10,
+  "logs": [
+    "13 findings: verifying 6 (incl. 1 canary), 8 held as unverified (budget)",
+    "gate: 5 passed, 1 refuted, 8 held"
+  ],
+  "result": {
+    "passed": [
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 12,
+        "category": "blocking-in-async",
+        "severity": "high",
+        "evidence": "`    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)` - Await.result blocks a thread of the injected ExecutionContext inside a Future body and is not wrapped in `blocking { }`, so under load it can starve the pool; the 30-second bound limits how long each thread is held but does not make the blocking call non-blocking.",
+        "proposedTest": "Make the global ExecutionContext single-threaded, call placeOrder twice with a PaymentClient stub whose charge returns a Future that completes after 1s, and assert the second placeOrder does not wait for the first (both should be in flight). Fails today because the first Await.result pins the only thread; passes after composing with flatMap instead of Await.result.",
+        "origin": "auditor",
+        "verdict": {
+          "status": "supported",
+          "quotedCode": "def placeOrder(order: Order): Future[Option[String]] = Future {\n    repo.insert(order)\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\n    Thread.sleep(200)\n    Some((receipt \\ \"id\").as[String])\n  }.recover { case _: Exception => None }",
+          "reasoning": "Line 12 calls Await.result inside a Future body that runs on the injected default implicit ExecutionContext `ec`. It is not wrapped in `blocking {}` and does not use the dedicated `blockingEc`. That means a pool thread can be held for up to 30s. Line 13's Thread.sleep and the synchronous repo.insert make it worse. The file does have a mitigation, a dedicated blocking executor, but only loadHistory uses it, so placeOrder gets no benefit. The 30s timeout caps how long each call can block, but the call still blocks the async pool. I confirmed the defect in the code."
+        }
+      },
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 15,
+        "category": "swallowed-exception",
+        "severity": "high",
+        "evidence": "`  }.recover { case _: Exception => None }` - every exception from repo.insert, payments.charge, or the receipt parse is discarded with no logging or metric, so a failed charge is reported to the caller only as None, indistinguishable from other failures.",
+        "proposedTest": "Stub PaymentClient.charge to return a failed Future with a RuntimeException and assert placeOrder fails or returns a distinguishable error and that the exception is logged. Fails today because the result is silently Future(None) with no trace of the cause.",
+        "origin": "auditor",
+        "verdict": {
+          "status": "supported",
+          "quotedCode": "  def placeOrder(order: Order): Future[Option[String]] = Future {\n    repo.insert(order)\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\n    Thread.sleep(200)\n    Some((receipt \\ \"id\").as[String])\n  }.recover { case _: Exception => None }",
+          "reasoning": "Line 15 catches every Exception and returns None. It does not log, rethrow, or record metrics. The exception type is lost, so a DB insert failure, a payment timeout (TimeoutException), a payment failure, and a JSON parse error all look like the same None to the caller. A partial failure is also hidden: the order is inserted but the charge fails, and nothing reports it. No mitigation exists in the file. PaymentClient and the callers are not in the repo, so nothing outside the file can surface the error."
+        }
+      },
+      {
+        "file": "app/payments/PaymentClient.scala",
+        "line": 18,
+        "category": "missing-idempotency",
+        "severity": "high",
+        "evidence": ".post(Json.obj(\"order\" -> orderId, \"amount\" -> amountCents)) - the charge POST carries no idempotency key, and it is re-sent by the retry on line 22 after any exception, so a request that timed out after the PSP already charged the card will be charged again.",
+        "proposedTest": "Stub the PSP to accept the first POST but time out the response; assert that the retried request carries the same Idempotency-Key header (derived from orderId) and that the PSP records only one charge for the order.",
+        "origin": "auditor",
+        "verdict": {
+          "status": "supported",
+          "quotedCode": "    ws.url(s\"$baseUrl/charges\")\n      .post(Json.obj(\"order\" -> orderId, \"amount\" -> amountCents))\n      .map(_.json)\n      .recoverWith { case _ =>\n        log.warn(s\"charge failed for $orderId, attempt $attempt, retrying\")\n        chargeWithRetry(orderId, amountCents, attempt + 1)\n      }",
+          "reasoning": "Line 18 POSTs a charge, which is not idempotent. On any failure, including a timeout where the PSP may already have processed the charge, recoverWith retries it. The request sends no Idempotency-Key header (there is no withHttpHeaders call) and has no request-level dedup token. The order id in the body only works as an idempotency key if the PSP enforces that, and nothing in the repo shows it does. So a retry can double-charge. The retry is also unbounded: attempt is never checked. I found no mitigation in the file."
+        }
+      },
+      {
+        "file": "app/payments/PaymentClient.scala",
+        "line": 22,
+        "category": "unbounded-retry",
+        "severity": "high",
+        "evidence": "chargeWithRetry(orderId, amountCents, attempt + 1) - the recoverWith on line 20 matches every Throwable (`case _ =>`) and recurses with no attempt cap, no backoff and no check on the attempt counter, so a PSP outage retries forever with an ever-growing future chain.",
+        "proposedTest": "Stub ws so that every request fails with a connection exception; assert charge(...) fails after a fixed maximum number of attempts (e.g. 3) instead of never completing, and that the number of POST calls equals that maximum.",
+        "origin": "auditor",
+        "verdict": {
+          "status": "supported",
+          "quotedCode": ".recoverWith { case _ =>\n        log.warn(s\"charge failed for $orderId, attempt $attempt, retrying\")\n        chargeWithRetry(orderId, amountCents, attempt + 1)\n      }",
+          "reasoning": "I confirmed this in the code. chargeWithRetry adds 1 to `attempt` on every failure, but nothing ever checks it against a limit, so it retries forever. There's no max-attempts guard, no backoff and no delay. The `case _` also catches every error, including 4xx failures that will never succeed. The charge POST has no withRequestTimeout either (refundStatus sets one, charge doesn't). It also sends no idempotency key, so each retry of a non-idempotent payment call could charge the customer twice. Nothing in the file bounds the retry: no wrapper, no circuit breaker and no counter check."
+        }
+      },
+      {
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 12,
+        "category": "unbounded-pool",
+        "severity": "high",
+        "evidence": "private final ExecutorService workers = Executors.newCachedThreadPool(); - newCachedThreadPool creates a new thread whenever no idle thread exists and has no upper bound, and onMessage submits one drain task per message (line 25), so a burst of messages can spawn an unbounded number of threads.",
+        "proposedTest": "Call onMessage() 10,000 times while the stub at http://stock blocks; assert the number of live worker threads stays at or below a fixed cap (for example, 8). Fails today because the cached pool grows with the message count.",
+        "origin": "auditor",
+        "verdict": {
+          "status": "supported",
+          "quotedCode": "private final ExecutorService workers = Executors.newCachedThreadPool();\n...\npublic void onMessage(String sku) {\n    inbox.offer(sku);\n    workers.submit(this::drain);\n}",
+          "reasoning": "Executors.newCachedThreadPool() has no upper bound on threads: it uses a SynchronousQueue with max pool size Integer.MAX_VALUE. Every onMessage call submits a new drain task. When downstream calls are slow (each can block for up to 2s connect plus 5s read), no idle thread is free, so the pool creates a new thread for each message. A burst of messages therefore causes unbounded thread growth. Nothing limits this: there is no bounded executor wrapper, no semaphore, and no backpressure. The RestTemplate timeouts only cap how long one call can block. They do not cap how many threads exist. The inbox LinkedBlockingQueue is also unbounded."
+        }
+      }
+    ],
+    "rejected": [
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 18,
+        "category": "blocking-in-async",
+        "severity": "high",
+        "evidence": "CANARY: known-false claim injected to test the gate",
+        "proposedTest": "n/a",
+        "origin": "CANARY",
+        "verdict": {
+          "status": "refuted",
+          "quotedCode": "  def loadHistory(customerId: String): Future[Seq[Order]] =\n    Future {\n      blocking {\n        repo.findByCustomer(customerId)\n      }\n    }(blockingEc)",
+          "reasoning": "The claim is about line 18, which is the start of loadHistory. There, the blocking repository call is wrapped in `blocking {}` and runs on a dedicated `blockingEc` (BlockingExecutionContext), which is passed explicitly. So it does not block the default async pool, and the defect at line 18 does not hold. The real blocking-in-async defect is in placeOrder at lines 11-13: repo.insert, Await.result and Thread.sleep all run on the default implicit `ec` with no `blocking` wrapper. That is a different location from the one claimed."
+        }
+      }
+    ],
+    "held": [
+      {
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 13,
+        "category": "unbounded-queue",
+        "severity": "high",
+        "evidence": "private final BlockingQueue<String> inbox = new LinkedBlockingQueue<>(); - LinkedBlockingQueue with no capacity argument is unbounded, so inbound SKUs accumulate without limit when the downstream stock service is slow, and offer() on line 24 can never signal backpressure.",
+        "proposedTest": "Construct the consumer, block the stock endpoint, send 1,000,000 messages, and assert that onMessage either rejects or blocks once a configured capacity (for example, 1,000) is reached. Fails today because the queue grows without bound and every offer succeeds.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 12,
+        "category": "missing-timeout",
+        "severity": "high",
+        "evidence": "private final RestTemplate rest = new RestTemplate(); - the default RestTemplate has no connect or read timeout, so every call on this shared client (createShipment line 16, trackingStatus line 22) can block indefinitely on a hung carrier connection.",
+        "proposedTest": "Stub the carrier with a server that accepts the connection and never responds. Assert that createShipment and trackingStatus fail with a timeout exception within a bounded time (for example 5 seconds). Today the call blocks until the test runner kills it, so the test fails. After the fix, the RestTemplate is built with a request factory that sets connect and read timeouts, and the test passes.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 16,
+        "category": "missing-idempotency",
+        "severity": "high",
+        "evidence": "return rest.postForObject(\"http://carrier/api/shipments\", - this non-idempotent POST that creates a shipment is retried by @Retryable on any failure, including a timeout after the carrier already created the shipment, so one order can get several shipments. No idempotency key is sent.",
+        "proposedTest": "Use a fake carrier that records every POST and creates the shipment, then drops the response on the first call. Call createShipment once and assert the carrier recorded exactly one shipment for that orderId. Today the retry produces two, so the test fails. After the fix, an Idempotency-Key header derived from orderId is sent and the carrier deduplicates, or the retry is disabled for this method, and the test passes.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 13,
+        "category": "blocking-in-async",
+        "severity": "medium",
+        "evidence": "`    Thread.sleep(200)` - Thread.sleep inside a Future body parks an execution-context thread for 200ms on every successful order, with no `blocking` wrapper and no reason for the delay.",
+        "proposedTest": "Use a single-thread ExecutionContext and call placeOrder 10 times with an instant payment stub; measure total wall time and assert it is under 500ms. Fails today (about 2s, serialised by sleep); passes after removing the sleep or replacing it with a non-blocking scheduled delay.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 33,
+        "category": "swallowed-exception",
+        "severity": "medium",
+        "evidence": "} catch (Exception e) { - the catch block on line 34 is empty, so every failed reservation POST (timeout, 5xx, connection refused) is silently discarded with no log, retry, or dead-letter handling.",
+        "proposedTest": "Make the stub at http://stock return 503 and assert that the failure is recorded (logged or re-queued/dead-lettered) with the SKU identified. Fails today because nothing is recorded and the reservation is lost silently.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 14,
+        "category": "naive-retry",
+        "severity": "medium",
+        "evidence": "@Retryable(maxAttempts = 10) - ten attempts with no backoff and no restriction on which exceptions are retried, so a carrier outage gets ten back-to-back hammering requests and client-side errors (for example 400) are retried too. Note that this annotation is inert unless @EnableRetry is configured elsewhere, which this file does not show.",
+        "proposedTest": "Mock the carrier to always return HTTP 503 and record request timestamps. Assert that the gaps between attempts grow (exponential backoff, for example with @Backoff(delay = 500, multiplier = 2)) and that a 400 response is not retried. Today the test sees ten attempts with near-zero gaps, so it fails. After the fix, the attempt gaps and attempt count match the configured policy.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 22,
+        "category": "missing-timeout",
+        "severity": "medium",
+        "evidence": "() -> rest.getForObject(\"http://carrier/api/track/\" + trackingId, String.class));, with the caller bounding the result by f.get(2, TimeUnit.SECONDS) on line 23. The 2-second bound applies only to the caller. When it expires, the task keeps running on the shared ForkJoin common pool with no timeout on the HTTP call and is never cancelled, so repeated slow tracking calls can exhaust the common pool.",
+        "proposedTest": "Make the fake carrier stall for 60 seconds on the track endpoint. Call trackingStatus 20 times in a row, each of which times out after 2 seconds. Then assert that a later unrelated CompletableFuture.supplyAsync task still completes promptly. Today the common pool threads stay blocked, so the test fails. After the fix, the RestTemplate read timeout is set and the future is cancelled on timeout (f.cancel(true)), and the test passes.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      },
+      {
+        "file": "app/payments/PaymentClient.scala",
+        "line": 17,
+        "category": "missing-timeout",
+        "severity": "low",
+        "evidence": "ws.url(s\"$baseUrl/charges\") - unlike refundStatus (line 27, which calls withRequestTimeout), the charge request sets no explicit request timeout, so it relies on the global Play WS default for a payment call.",
+        "proposedTest": "Stub the PSP to never respond to POST /charges; assert the charge future fails within a configured bound (e.g. 10s) rather than waiting on the library default.",
+        "status": "unverified",
+        "reason": "not checked: verifier budget"
+      }
+    ],
+    "quarantine": [],
+    "counts": {
+      "audited": 13,
+      "verified": 6
+    }
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Audit"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Select"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 4,
+      "title": "Gate"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "audit:PaymentClient.scala",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a5929a79f2ccfe7c3",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825432330,
+      "queuedAt": 1791825432314,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: app/payments/PaymentClient.scala (read it with the Read tool). Do not read other files. Do not modify anything.\nSet \"file\" …",
+      "promptFramed": true,
+      "lastProgressAt": 1791825442079,
+      "tokens": 39889,
+      "toolCalls": 2,
+      "durationMs": 9748,
+      "resultPreview": "{\"findings\":[{\"file\":\"app/payments/PaymentClient.scala\",\"line\":22,\"category\":\"unbounded-retry\",\"severity\":\"high\",\"evidence\":\"chargeWithRetry(orderId, amountCents, attempt + 1) - the recoverWith on line 20 matches every Throwable (`case _ =>`) and recurses with no attempt cap, no backoff and no check on the attempt counter, so a PSP outage retries forever with an ever-growing future chain.\",\"propos…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "audit:OrderService.scala",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a2437e98f019523c5",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825432330,
+      "queuedAt": 1791825432314,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: app/orders/OrderService.scala (read it with the Read tool). Do not read other files. Do not modify anything.\nSet \"file\" to …",
+      "promptFramed": true,
+      "lastProgressAt": 1791825440710,
+      "tokens": 39762,
+      "toolCalls": 2,
+      "durationMs": 8378,
+      "resultPreview": "{\"findings\":[{\"file\":\"app/orders/OrderService.scala\",\"line\":12,\"category\":\"blocking-in-async\",\"severity\":\"high\",\"evidence\":\"`    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)` - Await.result blocks a thread of the injected ExecutionContext inside a Future body and is not wrapped in `blocking { }`, so under load it can starve the pool; the 30-second bound limit…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "audit:InventoryConsumer.java",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a1b3215ad789010e8",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825432331,
+      "queuedAt": 1791825432314,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: src/main/java/demo/inventory/InventoryConsumer.java (read it with the Read tool). Do not read other files. Do not modify an…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825441258,
+      "tokens": 39897,
+      "toolCalls": 2,
+      "durationMs": 8926,
+      "resultPreview": "{\"findings\":[{\"file\":\"src/main/java/demo/inventory/InventoryConsumer.java\",\"line\":12,\"category\":\"unbounded-pool\",\"severity\":\"high\",\"evidence\":\"private final ExecutorService workers = Executors.newCachedThreadPool(); - newCachedThreadPool creates a new thread whenever no idle thread exists and has no upper bound, and onMessage submits one drain task per message (line 25), so a burst of messages can…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "audit:ShippingGateway.java",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a93a36917ac4c62a3",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825432331,
+      "queuedAt": 1791825432314,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: src/main/java/demo/shipping/ShippingGateway.java (read it with the Read tool). Do not read other files. Do not modify anyth…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825445297,
+      "tokens": 39722,
+      "toolCalls": 2,
+      "durationMs": 12965,
+      "resultPreview": "{\"findings\":[{\"file\":\"src/main/java/demo/shipping/ShippingGateway.java\",\"line\":12,\"category\":\"missing-timeout\",\"severity\":\"high\",\"evidence\":\"private final RestTemplate rest = new RestTemplate(); - the default RestTemplate has no connect or read timeout, so every call on this shared client (createShipment line 16, trackingStatus line 22) can block indefinitely on a hung carrier connection.\",\"propos…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "verify:OrderService.scala:12",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a017f2439f953b6a0",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791825447659,
+      "queuedAt": 1791825447645,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"blocking-in-async\" at app/orders/OrderService.scala:12. Your job is to try to FALSIFY this claim against the actual code.\nRead app/orders/OrderService.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded wrapp…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825453901,
+      "tokens": 39695,
+      "toolCalls": 2,
+      "durationMs": 6242,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"def placeOrder(order: Order): Future[Option[String]] = Future {\\n    repo.insert(order)\\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\\n    Thread.sleep(200)\\n    Some((receipt \\\\ \\\"id\\\").as[String])\\n  }.recover { case _: Exception => None }\",\"reasoning\":\"Line 12 calls Await.result inside a Future body that runs on the …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "verify:OrderService.scala:15",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a32038611ba41ff69",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791825447659,
+      "queuedAt": 1791825447645,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"swallowed-exception\" at app/orders/OrderService.scala:15. Your job is to try to FALSIFY this claim against the actual code.\nRead app/orders/OrderService.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded wra…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825454677,
+      "tokens": 39695,
+      "toolCalls": 2,
+      "durationMs": 5974,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"  def placeOrder(order: Order): Future[Option[String]] = Future {\\n    repo.insert(order)\\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\\n    Thread.sleep(200)\\n    Some((receipt \\\\ \\\"id\\\").as[String])\\n  }.recover { case _: Exception => None }\",\"reasoning\":\"Line 15 catches every Exception and returns None. It does not l…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "verify:PaymentClient.scala:18",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a55264442812a3b1d",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791825447659,
+      "queuedAt": 1791825447645,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"missing-idempotency\" at app/payments/PaymentClient.scala:18. Your job is to try to FALSIFY this claim against the actual code.\nRead app/payments/PaymentClient.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bound…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825454390,
+      "tokens": 39827,
+      "toolCalls": 2,
+      "durationMs": 5686,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"    ws.url(s\\\"$baseUrl/charges\\\")\\n      .post(Json.obj(\\\"order\\\" -> orderId, \\\"amount\\\" -> amountCents))\\n      .map(_.json)\\n      .recoverWith { case _ =>\\n        log.warn(s\\\"charge failed for $orderId, attempt $attempt, retrying\\\")\\n        chargeWithRetry(orderId, amountCents, attempt + 1)\\n      }\",\"reasoning\":\"Line 18 POSTs a charge, which is not idempot…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "verify:PaymentClient.scala:22",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "aceb1b937ca634108",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791825447659,
+      "queuedAt": 1791825447645,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"unbounded-retry\" at app/payments/PaymentClient.scala:22. Your job is to try to FALSIFY this claim against the actual code.\nRead app/payments/PaymentClient.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded w…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825454089,
+      "tokens": 39827,
+      "toolCalls": 2,
+      "durationMs": 5385,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\".recoverWith { case _ =>\\n        log.warn(s\\\"charge failed for $orderId, attempt $attempt, retrying\\\")\\n        chargeWithRetry(orderId, amountCents, attempt + 1)\\n      }\",\"reasoning\":\"I confirmed this in the code. chargeWithRetry adds 1 to `attempt` on every failure, but nothing ever checks it against a limit, so it retries forever. There's no max-attempts gu…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "verify:InventoryConsumer.java:12",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a335298b6e1b183ca",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791825447659,
+      "queuedAt": 1791825447645,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"unbounded-pool\" at src/main/java/demo/inventory/InventoryConsumer.java:12. Your job is to try to FALSIFY this claim against the actual code.\nRead src/main/java/demo/inventory/InventoryConsumer.java with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: tim…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825454419,
+      "tokens": 39734,
+      "toolCalls": 2,
+      "durationMs": 5715,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"private final ExecutorService workers = Executors.newCachedThreadPool();\\n...\\npublic void onMessage(String sku) {\\n    inbox.offer(sku);\\n    workers.submit(this::drain);\\n}\",\"reasoning\":\"Executors.newCachedThreadPool() has no upper bound on threads: it uses a SynchronousQueue with max pool size Integer.MAX_VALUE. Every onMessage call submits a new drain task. …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "verify:OrderService.scala:18",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a774559dd8d992188",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791825447659,
+      "queuedAt": 1791825447645,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "refuted",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"blocking-in-async\" at app/orders/OrderService.scala:18. Your job is to try to FALSIFY this claim against the actual code.\nRead app/orders/OrderService.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded wrapp…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825453869,
+      "tokens": 39695,
+      "toolCalls": 2,
+      "durationMs": 5165,
+      "resultPreview": "{\"status\":\"refuted\",\"quotedCode\":\"  def loadHistory(customerId: String): Future[Seq[Order]] =\\n    Future {\\n      blocking {\\n        repo.findByCustomer(customerId)\\n      }\\n    }(blockingEc)\",\"reasoning\":\"The claim is about line 18, which is the start of loadHistory. There, the blocking repository call is wrapped in `blocking {}` and runs on a dedicated `blockingEc` (BlockingExecutionContext),…"
+    }
+  ],
+  "totalTokens": 397743,
+  "totalToolCalls": 20
+}

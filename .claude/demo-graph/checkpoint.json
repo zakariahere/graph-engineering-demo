@@ -1,0 +1,183 @@
+{
+  "graphVersion": "resilience-audit@1.0.0",
+  "createdAt": "2026-10-12",
+  "source": {
+    "commit": null,
+    "note": "not a git repo: content-addressed instead",
+    "treeSha256": "971ad0421d91a9c0b459917344c0b37892146c54921e0792f3bb56c25d47abf2",
+    "files": {
+      "app/payments/PaymentClient.scala": "0b5db70060231a7c210b9a124492fd47266e22892c896395c36f1e5f924239c9",
+      "app/orders/OrderService.scala": "9a92518436a56ce70361ea8c3c4833583b3af3897bd3b9a53660d78c9781e8b9",
+      "src/main/java/demo/inventory/InventoryConsumer.java": "9663502c84e538a5784894f395b6ad6fa651f443b8b675c75415d7ee6e4e4f6d",
+      "src/main/java/demo/shipping/ShippingGateway.java": "694e5867420a01deb4f6c8046a83335921710092cc22da51f94def4fc795d461"
+    }
+  },
+  "workflow": {
+    "path": ".claude/workflows/resilience-audit.js",
+    "sha256": "d391a2f862311ff9703834d30fdbf264cfe8f86ed273082eca75616fa7cf29eb"
+  },
+  "budgets": {
+    "maxSourceFiles": 5,
+    "maxAgentsPerStage": 6,
+    "verifierBudget": 6,
+    "models": {
+      "audit": "haiku",
+      "verify": "opus",
+      "synthesize": "opus"
+    }
+  },
+  "completedNodes": {
+    "stage0.recon": {
+      "status": "done",
+      "agents": 0
+    },
+    "stage1.linear": {
+      "status": "done",
+      "runId": "wf_5ff19232-b19",
+      "stage": 1,
+      "agents": 1,
+      "subagent_tokens": 41304,
+      "duration_ms": 22141,
+      "tool_uses": 4,
+      "findings": 17,
+      "planted_hit": 12,
+      "planted_total": 12,
+      "decoys_flagged": 0,
+      "factual_errors": [
+        "S2 claims retries are immediate; Spring Retry default backoff is 1000ms fixed"
+      ]
+    },
+    "stage2.scatterGather": {
+      "status": "done",
+      "runId": "wf_096a9ff3-d98",
+      "stage": 2,
+      "agents": 4,
+      "subagent_tokens": 157520,
+      "duration_ms": 13993,
+      "findings": 24,
+      "planted_hit": 12,
+      "planted_total": 12,
+      "decoys_flagged": 0,
+      "suspect": [
+        "Inventory:24 offer() on unbounded LBQ always returns true",
+        "PaymentClient:20 swallowed - actually logged+retried",
+        "Shipping:14 immediate retry - default backoff 1000ms",
+        "Order:20 unbounded result - off-theme, decoy region"
+      ]
+    },
+    "stage3.typedEdges": {
+      "status": "done",
+      "runId": "wf_a7a87163-1d3",
+      "stage": 3,
+      "agents": 4,
+      "subagent_tokens": 159214,
+      "duration_ms": 13140,
+      "findings_valid": 12,
+      "quarantined_real": 0,
+      "quarantined_injected": 2,
+      "planted_hit": 11,
+      "planted_total": 12,
+      "missed": [
+        "P1 PaymentClient:17 charge POST no timeout"
+      ],
+      "decoys_flagged": 0,
+      "suspect": [
+        "Shipping:14 proposedTest asserts no delay today - wrong, default 1000ms"
+      ]
+    },
+    "stage4.verifyGate": {
+      "status": "done",
+      "runId": "wf_cdc45416-14d",
+      "stage": 4,
+      "agents": 10,
+      "auditors": 4,
+      "verifiers": 6,
+      "subagent_tokens": 397743,
+      "duration_ms": 24535,
+      "findings_audited": 13,
+      "planted_hit": 12,
+      "verified": 6,
+      "supported": 5,
+      "refuted": 1,
+      "refuted_detail": "CANARY OrderService:18 (decoy) correctly refuted",
+      "unverified_verifier": 0,
+      "held_budget": 8,
+      "gate_passed": 5,
+      "observation": "ranking tiebreak by file path starved src/ (shipping+inventory) of verifier budget"
+    },
+    "stage5.synthesis": {
+      "status": "done",
+      "runId": "wf_cdc45416-14d",
+      "resumedFrom": "wf_cdc45416-14d",
+      "stage": 5,
+      "agents_total": 11,
+      "agents_live": 1,
+      "agents_cached": 10,
+      "subagent_tokens": 38667,
+      "duration_ms": 16051,
+      "findings_in": 5,
+      "root_causes": 4,
+      "grounding_problems": 0,
+      "notInEvidence": 5,
+      "observation": "verifier incidental remarks (charge timeout, unbounded inbox) leaked into rationales: grounded in evidence text but not gated as findings"
+    },
+    "stage6.failureInjection": {
+      "status": "done",
+      "runId": "wf_b9d044e4-8c3",
+      "stage": 6,
+      "agents": 10,
+      "auditors_live": 5,
+      "verifiers_live": 5,
+      "faulted_slots": 1,
+      "subagent_tokens": 397914,
+      "duration_ms": 23414,
+      "findings_audited": 14,
+      "quarantine": [
+        "PaymentRetryPolicy.scala: could not read (coverage gap)"
+      ],
+      "supported": 3,
+      "refuted": 1,
+      "refuted_detail": "CANARY still refuted",
+      "unverified_infra": 1,
+      "unverified_semantic": 1,
+      "held_budget": 10,
+      "sibling_auditors_completed": "4/4",
+      "sibling_verifiers_completed": "5/5",
+      "runtime_failures": [
+        "pipeline[1] failed: SIMULATED: verifier timed out"
+      ]
+    },
+    "stage7.wrapUp": {
+      "status": "done",
+      "agents": 0
+    }
+  },
+  "totals": {
+    "subagentTokens": 1192362
+  },
+  "knownGraphDefectsFixedInV1": [
+    "round-robin selection (stage4 starvation)",
+    "sideObservations routed to held; synthesizer sees structured fields only (stage5 leak)",
+    "fileStatus self-report + null->unverified (stage6)"
+  ],
+  "artifacts": [
+    ".claude/demo-graph/stage0-recon.md",
+    ".claude/demo-graph/stage1-metrics.json",
+    ".claude/demo-graph/stage1-result.json",
+    ".claude/demo-graph/stage1-script.js",
+    ".claude/demo-graph/stage2-metrics.json",
+    ".claude/demo-graph/stage2-script.js",
+    ".claude/demo-graph/stage3-metrics.json",
+    ".claude/demo-graph/stage3-result.json",
+    ".claude/demo-graph/stage3-script.js",
+    ".claude/demo-graph/stage4-metrics.json",
+    ".claude/demo-graph/stage4-result.json",
+    ".claude/demo-graph/stage4-script.js",
+    ".claude/demo-graph/stage5-metrics.json",
+    ".claude/demo-graph/stage5-result.json",
+    ".claude/demo-graph/stage5-script.js",
+    ".claude/demo-graph/stage6-metrics.json",
+    ".claude/demo-graph/stage6-result.json",
+    ".claude/demo-graph/stage6-script.js"
+  ]
+}

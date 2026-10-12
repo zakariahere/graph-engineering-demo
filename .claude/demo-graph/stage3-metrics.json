@@ -1,0 +1,1 @@
+{"stage":3,"agents":4,"subagent_tokens":159214,"duration_ms":13140,"findings_valid":12,"quarantined_real":0,"quarantined_injected":2,"planted_hit":11,"planted_total":12,"missed":["P1 PaymentClient:17 charge POST no timeout"],"decoys_flagged":0,"suspect":["Shipping:14 proposedTest asserts no delay today - wrong, default 1000ms"]}

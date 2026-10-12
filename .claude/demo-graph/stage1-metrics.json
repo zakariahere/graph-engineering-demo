@@ -1,0 +1,1 @@
+{"stage":1,"agents":1,"subagent_tokens":41304,"duration_ms":22141,"tool_uses":4,"findings":17,"planted_hit":12,"planted_total":12,"decoys_flagged":0,"factual_errors":["S2 claims retries are immediate; Spring Retry default backoff is 1000ms fixed"]}

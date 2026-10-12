@@ -1,0 +1,547 @@
+{
+  "summary": "Per-file resilience audit → fair-budget adversarial verification gate → grounded synthesis",
+  "agentCount": 11,
+  "logs": [
+    "12 findings, 0 quarantined; verifying 6, 7 held (budget)",
+    "gate: 5 passed, 1 refuted, 7 held, 24 side leads"
+  ],
+  "result": {
+    "report": {
+      "rootCauses": [
+        {
+          "title": "Blocking Await.result on shared default ExecutionContext in placeOrder",
+          "findingIds": [
+            "F1"
+          ],
+          "blastRadius": "system",
+          "rank": 1,
+          "rationale": "Line 12 calls Await.result on payments.charge for up to 30s inside a Future on the default injected ExecutionContext, with no blocking{} wrapper and no dedicated executor, so it ties up a shared pool thread for that whole time."
+        },
+        {
+          "title": "Unbounded cached thread pool for inventory message processing",
+          "findingIds": [
+            "F3"
+          ],
+          "blastRadius": "system",
+          "rank": 2,
+          "rationale": "The workers pool uses Executors.newCachedThreadPool(), which has no upper limit on threads, and onMessage submits one task per message, so a burst of messages or a slow stock service can create threads without limit."
+        },
+        {
+          "title": "Non-idempotent payment charge retried without Idempotency-Key",
+          "findingIds": [
+            "F2"
+          ],
+          "blastRadius": "service",
+          "rank": 3,
+          "rationale": "POST /charges is retried on any failure with no Idempotency-Key header, so a call that timed out or failed after the server processed it can charge the customer twice."
+        },
+        {
+          "title": "ShippingGateway RestTemplate has no connect/read timeout",
+          "findingIds": [
+            "F4"
+          ],
+          "blastRadius": "service",
+          "rank": 4,
+          "rationale": "The RestTemplate is built with its no-arg constructor, so it uses SimpleClientHttpRequestFactory with no connect or read timeout (0 means infinite), and nothing else sets one."
+        },
+        {
+          "title": "placeOrder swallows all exceptions into None without logging",
+          "findingIds": [
+            "F5"
+          ],
+          "blastRadius": "request",
+          "rank": 5,
+          "rationale": "The .recover { case _: Exception => None } catches every Exception from the insert, the payment charge, the timeout and the JSON parse and turns it into None; nothing logs or rethrows it, so the caller cannot tell what failed."
+        }
+      ],
+      "notInEvidence": [
+        "Whether the retry in chargeWithRetry has any attempt cap or backoff (code shown does not show a bound check)",
+        "Whether Thread.sleep(200) in placeOrder also blocks the shared pool materially (not stated as a defect)",
+        "Whether F4's infinite timeout can exhaust a shared request thread pool (system-level impact not established)",
+        "Whether F5 hides a successful charge followed by a failed parse, causing order/payment inconsistency",
+        "Whether repo.insert in placeOrder is a blocking JDBC call"
+      ]
+    },
+    "findings": [
+      {
+        "id": "F1",
+        "file": "app/orders/OrderService.scala",
+        "line": 12,
+        "category": "blocking-in-async",
+        "verifiedCode": "  def placeOrder(order: Order): Future[Option[String]] = Future {\n    repo.insert(order)\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\n    Thread.sleep(200)",
+        "defect": "Line 12 calls Await.result on payments.charge for up to 30s inside a Future that runs on the default injected ExecutionContext, with no blocking{} wrapper and no dedicated executor, so it ties up a shared pool thread for that whole time."
+      },
+      {
+        "id": "F2",
+        "file": "app/payments/PaymentClient.scala",
+        "line": 18,
+        "category": "missing-idempotency",
+        "verifiedCode": "    ws.url(s\"$baseUrl/charges\")\n      .post(Json.obj(\"order\" -> orderId, \"amount\" -> amountCents))\n      .map(_.json)\n      .recoverWith { case _ =>\n        log.warn(s\"charge failed for $orderId, attempt $attempt, retrying\")\n        chargeWithRetry(orderId, amountCents, attempt + 1)\n      }",
+        "defect": "The non-idempotent POST /charges is retried on any failure with no Idempotency-Key header, so a call that timed out or failed after the server processed it can charge the customer twice."
+      },
+      {
+        "id": "F3",
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 12,
+        "category": "unbounded-pool",
+        "verifiedCode": "private final ExecutorService workers = Executors.newCachedThreadPool();",
+        "defect": "The workers pool is built with Executors.newCachedThreadPool(), which has no upper limit on threads, and onMessage submits one task per message, so a burst of messages or a slow stock service can create threads without limit."
+      },
+      {
+        "id": "F4",
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 12,
+        "category": "missing-timeout",
+        "verifiedCode": "    private final RestTemplate rest = new RestTemplate();",
+        "defect": "The RestTemplate on line 12 is built with its no-arg constructor, so it uses SimpleClientHttpRequestFactory with no connect or read timeout (0 means infinite), and nothing else sets one."
+      },
+      {
+        "id": "F5",
+        "file": "app/orders/OrderService.scala",
+        "line": 15,
+        "category": "swallowed-exception",
+        "verifiedCode": "  def placeOrder(order: Order): Future[Option[String]] = Future {\n    repo.insert(order)\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\n    Thread.sleep(200)\n    Some((receipt \\ \"id\").as[String])\n  }.recover { case _: Exception => None }",
+        "defect": "The `.recover { case _: Exception => None }` on line 15 catches every Exception from the insert, the payment charge, the timeout and the JSON parse, and turns it into None. Nothing logs it and nothing rethrows it, so the caller cannot tell what failed."
+      }
+    ],
+    "problems": [],
+    "rejected": [
+      {
+        "claim": "app/orders/OrderService.scala:18 blocking-in-async",
+        "origin": "CANARY",
+        "why": "Line 18 is not a blocking-in-async defect: the blocking repo call is wrapped in `blocking {}` and runs on a dedicated `blockingEc` executor, not the default async pool."
+      }
+    ],
+    "held": [
+      {
+        "claim": "app/payments/PaymentClient.scala:22 unbounded-retry",
+        "why": "not checked: verifier budget"
+      },
+      {
+        "claim": "app/payments/PaymentClient.scala:17 missing-timeout",
+        "why": "not checked: verifier budget"
+      },
+      {
+        "claim": "app/orders/OrderService.scala:13 blocking-in-async",
+        "why": "not checked: verifier budget"
+      },
+      {
+        "claim": "src/main/java/demo/inventory/InventoryConsumer.java:13 unbounded-queue",
+        "why": "not checked: verifier budget"
+      },
+      {
+        "claim": "src/main/java/demo/inventory/InventoryConsumer.java:33 swallowed-exception",
+        "why": "not checked: verifier budget"
+      },
+      {
+        "claim": "src/main/java/demo/shipping/ShippingGateway.java:14 naive-retry",
+        "why": "not checked: verifier budget"
+      },
+      {
+        "claim": "src/main/java/demo/shipping/ShippingGateway.java:16 missing-idempotency",
+        "why": "not checked: verifier budget"
+      }
+    ],
+    "leads": [
+      {
+        "from": "app/orders/OrderService.scala:12",
+        "observation": "Line 13: Thread.sleep(200) also blocks the default pool thread.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:12",
+        "observation": "Line 11: repo.insert is a synchronous call, likely blocking DB I/O, and it also runs on the default ec.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:12",
+        "observation": "Line 15: recover { case _: Exception => None } swallows every failure, including a payment timeout that happens after the order is inserted. This can leave an order persisted but not charged, and nothing makes it visible.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:12",
+        "observation": "repo.insert happens before the charge, and nothing compensates or uses an idempotency key if the charge fails.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/payments/PaymentClient.scala:18",
+        "observation": "The retry has no limit: attempt goes up but is never checked, so a failing request retries forever.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/payments/PaymentClient.scala:18",
+        "observation": "There is no backoff between retries.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/payments/PaymentClient.scala:18",
+        "observation": "recoverWith uses `case _`, so it retries every error, including 4xx-style failures that will never succeed.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/payments/PaymentClient.scala:18",
+        "observation": "The charge POST has no request timeout, while refundStatus sets one of 3 seconds.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/payments/PaymentClient.scala:18",
+        "observation": "In refundStatus, `.recover { ... throw e }` only logs and rethrows. That is harmless, but `recover` is not needed for it.",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/inventory/InventoryConsumer.java:12",
+        "observation": "Line 13: the LinkedBlockingQueue inbox has no capacity limit, so it can also grow without bound.",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/inventory/InventoryConsumer.java:12",
+        "observation": "Lines 33-34: the empty catch block swallows exceptions, so a failed reserve call is lost with no retry and no log entry.",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/inventory/InventoryConsumer.java:12",
+        "observation": "There is no shutdown of the executor (no @PreDestroy).",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/inventory/InventoryConsumer.java:12",
+        "observation": "The reserve POST has no idempotency key.",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/shipping/ShippingGateway.java:12",
+        "observation": "@Retryable(maxAttempts = 10) on createShipment retries a non-idempotent POST without an idempotency key, so a retry can create duplicate shipments. It also sets no backoff and no retry filter.",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/shipping/ShippingGateway.java:12",
+        "observation": "trackingStatus runs supplyAsync on the shared ForkJoinPool common pool instead of a dedicated executor, and it does not cancel the future after a timeout, so blocked threads can pile up.",
+        "status": "unverified"
+      },
+      {
+        "from": "src/main/java/demo/shipping/ShippingGateway.java:12",
+        "observation": "trackingStatus declares throws Exception and lets TimeoutException and ExecutionException through without wrapping them.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:15",
+        "observation": "Line 12: Await.result blocks for up to 30s on the default ExecutionContext. The call is not wrapped in blocking{} and does not use blockingEc.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:15",
+        "observation": "Line 13: Thread.sleep(200) blocks a thread of the default ExecutionContext.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:15",
+        "observation": "Line 11: repo.insert is a synchronous DB call on the default EC. It runs before the charge and is not compensated, so a failed charge leaves an orphan order.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:15",
+        "observation": "There is no idempotency key on payments.charge. The order.id is passed, but whether it is used as an idempotency key is unknown.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:18",
+        "observation": "Line 12: Await.result(payments.charge(...), 30.seconds) inside a Future on the default ec is a real blocking-in-async defect.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:18",
+        "observation": "Line 13: Thread.sleep(200) on the default ec also blocks it.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:18",
+        "observation": "Line 11: repo.insert runs on the default ec with no blocking wrapper.",
+        "status": "unverified"
+      },
+      {
+        "from": "app/orders/OrderService.scala:18",
+        "observation": "Line 15: recover turns every Exception into None, which hides failures; the charge may also be retried without an idempotency key.",
+        "status": "unverified"
+      }
+    ],
+    "quarantine": [],
+    "canaryOk": true,
+    "counts": {
+      "audited": 12,
+      "verified": 6,
+      "passed": 5,
+      "rejected": 1,
+      "held": 7
+    }
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Audit"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Select"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 3,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 4,
+      "title": "Gate"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 5,
+      "title": "Synthesize"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "audit:PaymentClient.scala",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a236874c4a59858ac",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791826236403,
+      "queuedAt": 1791826236373,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "read",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: app/payments/PaymentClient.scala (read it with the Read tool). Do not read other files. Do not modify anything.\nIf the file…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826245304,
+      "tokens": 40087,
+      "toolCalls": 2,
+      "durationMs": 8900,
+      "resultPreview": "{\"fileStatus\":\"read\",\"findings\":[{\"file\":\"app/payments/PaymentClient.scala\",\"line\":22,\"category\":\"unbounded-retry\",\"severity\":\"high\",\"evidence\":\"`chargeWithRetry(orderId, amountCents, attempt + 1)` inside `.recoverWith { case _ =>` (lines 20-23). The recovery retries every failure with no maximum attempt count and no backoff, so a PSP outage produces an endless retry loop that keeps issuing charge…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "audit:OrderService.scala",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "afa54eddc9e1f4b8a",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791826236404,
+      "queuedAt": 1791826236373,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "read",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: app/orders/OrderService.scala (read it with the Read tool). Do not read other files. Do not modify anything.\nIf the file ca…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826245290,
+      "tokens": 40013,
+      "toolCalls": 2,
+      "durationMs": 8128,
+      "resultPreview": "{\"fileStatus\":\"read\",\"findings\":[{\"file\":\"app/orders/OrderService.scala\",\"line\":12,\"category\":\"blocking-in-async\",\"severity\":\"high\",\"evidence\":\"val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds) - Await.result blocks a thread of the global ExecutionContext inside a Future body, so each in-flight placeOrder can pin a pool thread for up to 30 seconds while waiting on…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "audit:InventoryConsumer.java",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a8e8f01e4df35156c",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791826236404,
+      "queuedAt": 1791826236373,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "read",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: src/main/java/demo/inventory/InventoryConsumer.java (read it with the Read tool). Do not read other files. Do not modify an…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826245263,
+      "tokens": 40080,
+      "toolCalls": 2,
+      "durationMs": 8101,
+      "resultPreview": "{\"fileStatus\":\"read\",\"findings\":[{\"file\":\"src/main/java/demo/inventory/InventoryConsumer.java\",\"line\":12,\"category\":\"unbounded-pool\",\"severity\":\"high\",\"evidence\":\"private final ExecutorService workers = Executors.newCachedThreadPool(); - a cached pool has no thread cap, and onMessage submits one drain task per message, so a burst of messages can create an unbounded number of threads while the down…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "audit:ShippingGateway.java",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "ad773bcdaa10f0c94",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791826236404,
+      "queuedAt": 1791826236374,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "read",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: src/main/java/demo/shipping/ShippingGateway.java (read it with the Read tool). Do not read other files. Do not modify anyth…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826245783,
+      "tokens": 39934,
+      "toolCalls": 2,
+      "durationMs": 8620,
+      "resultPreview": "{\"fileStatus\":\"read\",\"findings\":[{\"file\":\"src/main/java/demo/shipping/ShippingGateway.java\",\"line\":12,\"category\":\"missing-timeout\",\"severity\":\"high\",\"evidence\":\"private final RestTemplate rest = new RestTemplate(); - a default RestTemplate has no connect or read timeout, so every carrier call (createShipment and trackingStatus) can block indefinitely on a hung connection.\",\"proposedTest\":\"Construc…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 5,
+      "label": "verify:OrderService.scala:12",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a29111c86e1641a6d",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826248674,
+      "queuedAt": 1791826248660,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"blocking-in-async\" at app/orders/OrderService.scala:12. Your job is to try to FALSIFY this claim against the actual code.\nRead app/orders/OrderService.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded wrapp…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826257764,
+      "tokens": 39818,
+      "toolCalls": 2,
+      "durationMs": 9089,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"  def placeOrder(order: Order): Future[Option[String]] = Future {\\n    repo.insert(order)\\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\\n    Thread.sleep(200)\",\"defect\":\"Line 12 calls Await.result on payments.charge for up to 30s inside a Future that runs on the default injected ExecutionContext, with no blocking{} wrap…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 6,
+      "label": "verify:PaymentClient.scala:18",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "ad664456d5b909099",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826248674,
+      "queuedAt": 1791826248660,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"missing-idempotency\" at app/payments/PaymentClient.scala:18. Your job is to try to FALSIFY this claim against the actual code.\nRead app/payments/PaymentClient.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bound…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826259135,
+      "tokens": 39950,
+      "toolCalls": 2,
+      "durationMs": 9124,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"    ws.url(s\\\"$baseUrl/charges\\\")\\n      .post(Json.obj(\\\"order\\\" -> orderId, \\\"amount\\\" -> amountCents))\\n      .map(_.json)\\n      .recoverWith { case _ =>\\n        log.warn(s\\\"charge failed for $orderId, attempt $attempt, retrying\\\")\\n        chargeWithRetry(orderId, amountCents, attempt + 1)\\n      }\",\"defect\":\"The non-idempotent POST /charges is retried on …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 7,
+      "label": "verify:InventoryConsumer.java:12",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a306f3ac64b0100d9",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826248675,
+      "queuedAt": 1791826248660,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"unbounded-pool\" at src/main/java/demo/inventory/InventoryConsumer.java:12. Your job is to try to FALSIFY this claim against the actual code.\nRead src/main/java/demo/inventory/InventoryConsumer.java with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: tim…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826257477,
+      "tokens": 39857,
+      "toolCalls": 2,
+      "durationMs": 7466,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"private final ExecutorService workers = Executors.newCachedThreadPool();\",\"defect\":\"The workers pool is built with Executors.newCachedThreadPool(), which has no upper limit on threads, and onMessage submits one task per message, so a burst of messages or a slow stock service can create threads without limit.\",\"reasoning\":\"newCachedThreadPool sets maximumPoolSize…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 8,
+      "label": "verify:ShippingGateway.java:12",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a2540d69e6c99857b",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826248675,
+      "queuedAt": 1791826248660,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"missing-timeout\" at src/main/java/demo/shipping/ShippingGateway.java:12. Your job is to try to FALSIFY this claim against the actual code.\nRead src/main/java/demo/shipping/ShippingGateway.java with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826257942,
+      "tokens": 39782,
+      "toolCalls": 2,
+      "durationMs": 7931,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"    private final RestTemplate rest = new RestTemplate();\",\"defect\":\"The RestTemplate on line 12 is built with its no-arg constructor, so it uses SimpleClientHttpRequestFactory with no connect or read timeout (0 means infinite), and nothing else sets one.\",\"reasoning\":\"Line 12 calls new RestTemplate() directly. It does not use a configured RestTemplateBuilder be…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 9,
+      "label": "verify:OrderService.scala:15",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a155fce6290c18efa",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826248675,
+      "queuedAt": 1791826248660,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "supported",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"swallowed-exception\" at app/orders/OrderService.scala:15. Your job is to try to FALSIFY this claim against the actual code.\nRead app/orders/OrderService.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded wra…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826258211,
+      "tokens": 39818,
+      "toolCalls": 2,
+      "durationMs": 8200,
+      "resultPreview": "{\"status\":\"supported\",\"quotedCode\":\"  def placeOrder(order: Order): Future[Option[String]] = Future {\\n    repo.insert(order)\\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\\n    Thread.sleep(200)\\n    Some((receipt \\\\ \\\"id\\\").as[String])\\n  }.recover { case _: Exception => None }\",\"defect\":\"The `.recover { case _: Exception => None }` on line 15 catches ev…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 10,
+      "label": "verify:OrderService.scala:18",
+      "phaseIndex": 3,
+      "phaseTitle": "Verify",
+      "agentId": "a06936cfa3eeb6af2",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826248675,
+      "queuedAt": 1791826248660,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "refuted",
+      "promptPreview": "You are a skeptical reviewer. Someone claims there is a resilience defect of type \"blocking-in-async\" at app/orders/OrderService.scala:18. Your job is to try to FALSIFY this claim against the actual code.\nRead app/orders/OrderService.scala with the Read tool. You may read other files in the repo for context. Do not modify anything.\nLook for mitigations: timeouts configured elsewhere, bounded wrapp…",
+      "promptFramed": true,
+      "lastProgressAt": 1791826256729,
+      "tokens": 39818,
+      "toolCalls": 2,
+      "durationMs": 6718,
+      "resultPreview": "{\"status\":\"refuted\",\"quotedCode\":\"  def loadHistory(customerId: String): Future[Seq[Order]] =\\n    Future {\\n      blocking {\\n        repo.findByCustomer(customerId)\\n      }\\n    }(blockingEc)\",\"defect\":\"Line 18 is not a blocking-in-async defect: the blocking repo call is wrapped in `blocking {}` and runs on a dedicated `blockingEc` executor, not the default async pool.\",\"reasoning\":\"Lines 17-22…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 11,
+      "label": "synthesize",
+      "phaseIndex": 5,
+      "phaseTitle": "Synthesize",
+      "agentId": "a8a4a3dd69be8ca4f",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791826261622,
+      "queuedAt": 1791826261611,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "You are synthesizing VERIFIED resilience findings. Input (JSON):\n[\n {\n  \"id\": \"F1\",\n  \"file\": \"app/orders/OrderService.scala\",\n  \"line\": 12,\n  \"category\": \"blocking-in-async\",\n  \"verifiedCode\": \"  def placeOrder(order: Order): Future[Option[String]] = Future {\\n    repo.insert(order)\\n    val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\\n    Thread.sleep(200)\",\n …",
+      "promptFramed": true,
+      "lastProgressAt": 1791826269816,
+      "tokens": 37865,
+      "toolCalls": 1,
+      "durationMs": 8194,
+      "resultPreview": "{\"rootCauses\":[{\"title\":\"Blocking Await.result on shared default ExecutionContext in placeOrder\",\"findingIds\":[\"F1\"],\"blastRadius\":\"system\",\"rank\":1,\"rationale\":\"Line 12 calls Await.result on payments.charge for up to 30s inside a Future on the default injected ExecutionContext, with no blocking{} wrapper and no dedicated executor, so it ties up a shared pool thread for that whole time.\"},{\"title\"…"
+    }
+  ],
+  "totalTokens": 437022,
+  "totalToolCalls": 21
+}

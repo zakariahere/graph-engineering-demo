@@ -1,0 +1,241 @@
+{
+  "summary": "Per-file auditors with a JSON-schema output contract plus a deterministic validator",
+  "agentCount": 4,
+  "logs": [
+    "12 valid findings, 2 quarantined"
+  ],
+  "result": {
+    "findings": [
+      {
+        "file": "app/payments/PaymentClient.scala",
+        "line": 22,
+        "category": "unbounded-retry",
+        "severity": "high",
+        "evidence": "chargeWithRetry(orderId, amountCents, attempt + 1) — the recoverWith on lines 20-23 re-invokes the charge POST on every failure with no attempt cap, no delay and no backoff, so a PSP outage produces an endless stream of retries.",
+        "proposedTest": "Stub the WSClient so POST /charges always fails. Call charge(\"o1\", 100L) and assert that it fails after a fixed maximum number of attempts (for example 3) with the last exception, instead of recursing indefinitely; assert the stub received at most that many POSTs."
+      },
+      {
+        "file": "app/payments/PaymentClient.scala",
+        "line": 18,
+        "category": "missing-idempotency",
+        "severity": "high",
+        "evidence": ".post(Json.obj(\"order\" -> orderId, \"amount\" -> amountCents))  — this non-idempotent charge POST is re-sent by the recoverWith on line 22 after any failure, and no Idempotency-Key header is set, so a timeout after the PSP already charged the card leads to a duplicate charge.",
+        "proposedTest": "Stub the PSP so the first POST /charges is recorded as processed but the client receives a timeout or connection reset. Call charge(\"o1\", 100L) and assert that the retried request carries the same idempotency key (or that the charge is not re-issued), and that the PSP records exactly one charge for order o1."
+      },
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 12,
+        "category": "blocking-in-async",
+        "severity": "high",
+        "evidence": "val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\n\nInside the `Future { ... }` on the implicit `ec`, this blocks a shared ExecutionContext thread for up to 30 seconds while waiting on the payment call, and is not wrapped in `blocking { }`, so the pool cannot compensate for the stalled thread.",
+        "proposedTest": "Stub PaymentClient.charge to return a Future that completes after 5s, run N concurrent placeOrder calls on a fixed-size ExecutionContext (e.g. 2 threads) and assert an unrelated Future scheduled on the same context completes within 100ms. Fails today because the blocked threads starve the pool; passes if placeOrder chains the charge with flatMap instead of Await.result."
+      },
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 13,
+        "category": "blocking-in-async",
+        "severity": "medium",
+        "evidence": "Thread.sleep(200)\n\nA hard-coded 200 ms thread sleep runs on the implicit `ec` after the payment call, occupying a pool thread for no functional reason and adding latency to every order.",
+        "proposedTest": "Call placeOrder with a stubbed payment client on a 1-thread ExecutionContext and assert that 10 sequential orders complete in well under 2 seconds total; today each order sleeps 200 ms on the single thread, so the total is at least 2 seconds and the test fails. Passes once the sleep is removed."
+      },
+      {
+        "file": "app/orders/OrderService.scala",
+        "line": 15,
+        "category": "swallowed-exception",
+        "severity": "high",
+        "evidence": ".recover { case _: Exception => None }\n\nAny exception from the repo insert or the payment charge is converted into None with no logging, metric or rethrow, so callers cannot distinguish a declined or timed-out payment from a successful order that simply had no receipt, and operators get no signal.",
+        "proposedTest": "Make PaymentClient.charge return Future.failed(new java.net.SocketTimeoutException()) and assert that placeOrder's failure is observable (either the Future fails, or a log/metric is emitted). Fails today because the Future silently succeeds with None."
+      },
+      {
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 33,
+        "category": "swallowed-exception",
+        "severity": "high",
+        "evidence": "`} catch (Exception e) {` followed by an empty block (line 34). The failed POST to http://stock/api/reserve/ is silently discarded, so a reservation that fails (timeout, 5xx, connection refused) is lost with no log, metric, retry, or dead-letter.",
+        "proposedTest": "Stub the stock endpoint to return HTTP 503 (or close the connection), call onMessage(\"SKU-1\"), and assert that the failure is recorded (for example, logged at WARN or sent to a dead-letter queue). The test fails today because nothing is recorded."
+      },
+      {
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 13,
+        "category": "unbounded-queue",
+        "severity": "medium",
+        "evidence": "`private final BlockingQueue<String> inbox = new LinkedBlockingQueue<>();` The LinkedBlockingQueue has no capacity bound, and onMessage (line 24, `inbox.offer(sku);`) adds to it without any limit or rejection path.",
+        "proposedTest": "Stub the stock endpoint to block, then call onMessage about 1,000,000 times while monitoring heap use or queue size. Assert that the consumer applies backpressure or rejects messages once a configured capacity (for example, 10,000) is reached. The test fails today because the queue grows without limit."
+      },
+      {
+        "file": "src/main/java/demo/inventory/InventoryConsumer.java",
+        "line": 12,
+        "category": "unbounded-pool",
+        "severity": "medium",
+        "evidence": "`private final ExecutorService workers = Executors.newCachedThreadPool();` A cached pool creates a new thread whenever none is idle and has no maximum size. onMessage (line 25, `workers.submit(this::drain);`) therefore spawns threads per message during a burst.",
+        "proposedTest": "Stub the stock endpoint to block, then send 10,000 onMessage calls and count live threads named pool-*. Assert that the count stays at or below a configured maximum (for example, 16). The test fails today because the thread count grows with the number of messages."
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 12,
+        "category": "missing-timeout",
+        "severity": "high",
+        "evidence": "private final RestTemplate rest = new RestTemplate();. The default RestTemplate has no connect or read timeout, so every carrier call made through it (lines 16 and 22) can block indefinitely on a stalled connection.",
+        "proposedTest": "Stub the carrier endpoint to accept the connection and never respond. Assert that createShipment and trackingStatus fail within a bounded time. Today the call hangs with no timeout; after the fix, a RestTemplate built with connect and read timeouts (for example via SimpleClientHttpRequestFactory) raises ResourceAccessException."
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 14,
+        "category": "naive-retry",
+        "severity": "high",
+        "evidence": "@Retryable(maxAttempts = 10)",
+        "proposedTest": "Make the carrier return HTTP 503 on every call and record the timestamps of each attempt. Assert that retries are spaced by an exponential backoff with jitter and that the total attempt count is capped. Today the annotation gives 10 back-to-back attempts with no delay, because no @Backoff is configured."
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 16,
+        "category": "missing-idempotency",
+        "severity": "high",
+        "evidence": "return rest.postForObject(\"http://carrier/api/shipments\",",
+        "proposedTest": "Make the carrier accept the POST and then time out the response on the first attempt. Assert that the retried call either reuses an idempotency key or does not create a second shipment for the same orderId. Today every @Retryable attempt re-POSTs with no idempotency key, so one order can produce multiple shipments."
+      },
+      {
+        "file": "src/main/java/demo/shipping/ShippingGateway.java",
+        "line": 22,
+        "category": "missing-timeout",
+        "severity": "medium",
+        "evidence": "() -> rest.getForObject(\"http://carrier/api/track/\" + trackingId, String.class));. The HTTP call runs with no timeout, so the 2-second f.get on line 23 only abandons the future and leaves a common ForkJoinPool thread blocked on the carrier call.",
+        "proposedTest": "Make the carrier track endpoint hang. Call trackingStatus repeatedly and assert that the number of blocked common-pool threads stays bounded. Today each timed-out call leaves its supplyAsync task blocked indefinitely, so the pool gets exhausted. After the fix, the HTTP client has its own read timeout and the task completes."
+      }
+    ],
+    "quarantine": [
+      {
+        "source": "INJECTED",
+        "finding": {
+          "file": "app/payments/PaymentClient.scala",
+          "line": 999,
+          "category": "missing-timeout",
+          "severity": "high",
+          "evidence": "ws.url(...).post(...) with no timeout at all here",
+          "proposedTest": "stub PSP to hang, expect failure within 5s"
+        },
+        "reason": "line 999 outside 1..34"
+      },
+      {
+        "source": "INJECTED",
+        "finding": {
+          "file": "app/payments/PaymentClient.Scala",
+          "line": 17,
+          "category": "missing-timeout",
+          "severity": "high",
+          "evidence": "n/a",
+          "proposedTest": ""
+        },
+        "reason": "file mismatch: \"app/payments/PaymentClient.Scala\"; evidence too short; proposedTest too short"
+      }
+    ],
+    "byCategory": {
+      "unbounded-retry": 1,
+      "missing-idempotency": 2,
+      "blocking-in-async": 2,
+      "swallowed-exception": 2,
+      "unbounded-queue": 1,
+      "unbounded-pool": 1,
+      "missing-timeout": 2,
+      "naive-retry": 1
+    }
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Audit"
+    },
+    {
+      "type": "workflow_phase",
+      "index": 2,
+      "title": "Validate"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "audit:PaymentClient.scala",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "aa7c7154aa133b493",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825276226,
+      "queuedAt": 1791825276201,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: app/payments/PaymentClient.scala (read it with the Read tool). Do not read other files. Do not modify anything.\nSet \"file\" …",
+      "promptFramed": true,
+      "lastProgressAt": 1791825286219,
+      "tokens": 39934,
+      "toolCalls": 2,
+      "durationMs": 9992,
+      "resultPreview": "{\"findings\":[{\"file\":\"app/payments/PaymentClient.scala\",\"line\":22,\"category\":\"unbounded-retry\",\"severity\":\"high\",\"evidence\":\"chargeWithRetry(orderId, amountCents, attempt + 1) — the recoverWith on lines 20-23 re-invokes the charge POST on every failure with no attempt cap, no delay and no backoff, so a PSP outage produces an endless stream of retries.\",\"proposedTest\":\"Stub the WSClient so POST /ch…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "audit:OrderService.scala",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a1f5c971091691c24",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825276226,
+      "queuedAt": 1791825276201,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: app/orders/OrderService.scala (read it with the Read tool). Do not read other files. Do not modify anything.\nSet \"file\" to …",
+      "promptFramed": true,
+      "lastProgressAt": 1791825285328,
+      "tokens": 39762,
+      "toolCalls": 2,
+      "durationMs": 8362,
+      "resultPreview": "{\"findings\":[{\"file\":\"app/orders/OrderService.scala\",\"line\":12,\"category\":\"blocking-in-async\",\"severity\":\"high\",\"evidence\":\"val receipt = Await.result(payments.charge(order.id, order.totalCents), 30.seconds)\\n\\nInside the `Future { ... }` on the implicit `ec`, this blocks a shared ExecutionContext thread for up to 30 seconds while waiting on the payment call, and is not wrapped in `blocking { }`, …"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "audit:InventoryConsumer.java",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "afc02448e01faf3c9",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825276226,
+      "queuedAt": 1791825276202,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: src/main/java/demo/inventory/InventoryConsumer.java (read it with the Read tool). Do not read other files. Do not modify an…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825284668,
+      "tokens": 39797,
+      "toolCalls": 2,
+      "durationMs": 7702,
+      "resultPreview": "{\"findings\":[{\"file\":\"src/main/java/demo/inventory/InventoryConsumer.java\",\"line\":33,\"category\":\"swallowed-exception\",\"severity\":\"high\",\"evidence\":\"`} catch (Exception e) {` followed by an empty block (line 34). The failed POST to http://stock/api/reserve/ is silently discarded, so a reservation that fails (timeout, 5xx, connection refused) is lost with no log, metric, retry, or dead-letter.\",\"pro…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "audit:ShippingGateway.java",
+      "phaseIndex": 1,
+      "phaseTitle": "Audit",
+      "agentId": "a08e84b7c954f37a6",
+      "model": "claude-haiku-5-5",
+      "state": "done",
+      "startedAt": 1791825276226,
+      "queuedAt": 1791825276202,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "Audit ONE source file for RESILIENCE defects only. Category must be one of: missing-timeout, unbounded-retry, naive-retry, blocking-in-async, swallowed-exception, missing-idempotency, unbounded-queue, unbounded-pool. If a suspected issue fits none of them, leave it out.\nFile: src/main/java/demo/shipping/ShippingGateway.java (read it with the Read tool). Do not read other files. Do not modify anyth…",
+      "promptFramed": true,
+      "lastProgressAt": 1791825286289,
+      "tokens": 39721,
+      "toolCalls": 2,
+      "durationMs": 9322,
+      "resultPreview": "{\"findings\":[{\"file\":\"src/main/java/demo/shipping/ShippingGateway.java\",\"line\":12,\"category\":\"missing-timeout\",\"severity\":\"high\",\"evidence\":\"private final RestTemplate rest = new RestTemplate();. The default RestTemplate has no connect or read timeout, so every carrier call made through it (lines 16 and 22) can block indefinitely on a stalled connection.\",\"proposedTest\":\"Stub the carrier endpoint …"
+    }
+  ],
+  "totalTokens": 159214,
+  "totalToolCalls": 8
+}

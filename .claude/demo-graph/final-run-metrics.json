@@ -1,0 +1,1 @@
+{"run":"resilience-audit@1.0.0","runId":"wf_93a40fa2-d40","agents":11,"subagent_tokens":437022,"duration_ms":35505,"audited":13,"verified":6,"passed":5,"refuted":1,"held":7,"root_causes":5,"grounding_problems":0,"files_with_verifier":"4/4"}
